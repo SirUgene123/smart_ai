@@ -1,0 +1,9 @@
+{
+  "timezone": "America/Los_Angeles",
+  "defaults": {
+    "requests_per_minute": null,
+    "input_tokens_per_minute": null,
+    "requests_per_day": null
+  },
+  "models": {}
+}
