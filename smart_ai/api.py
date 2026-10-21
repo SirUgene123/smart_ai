@@ -52,10 +52,9 @@ async def models() -> dict[str, Any]:
 @app.get("/v1/limits")
 async def get_limits() -> dict[str, Any]:
     try:
-        live_models = await providers.models()
-        return limits.status(live_models)
+        return limits.status()
     except RouterError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/v1/limits/reset")

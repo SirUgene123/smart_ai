@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import re
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -22,15 +23,26 @@ class LimitManager:
         self.state_path = settings.limit_state_file
 
     def _config(self) -> dict[str, Any]:
-        if not self.config_path.exists():
-            return {"timezone": "America/Los_Angeles", "defaults": {}, "models": {}}
+        bundled = Path(__file__).parent / "default_quotas.json"
         try:
-            value = json.loads(self.config_path.read_text(encoding="utf-8"))
+            value = json.loads(self.config_path.read_text(encoding="utf-8")) if self.config_path.exists() else {}
             if not isinstance(value, dict):
                 raise ValueError("root must be an object")
-            return value
+            if value.get("defaults") is not None and not isinstance(value["defaults"], dict):
+                raise ValueError("quota config 'defaults' must be a JSON object")
+            if value.get("models") is not None and not isinstance(value["models"], dict):
+                raise ValueError("quota config 'models' must be a JSON object")
+            base = json.loads(bundled.read_text(encoding="utf-8"))
+            if "timezone" in value:
+                base["timezone"] = value["timezone"]
+            base["defaults"].update(value.get("defaults") or {})
+            for model, overrides in (value.get("models") or {}).items():
+                if not isinstance(overrides, dict):
+                    raise ValueError(f"model quota entry {model!r} must be an object")
+                base["models"].setdefault(model, {}).update(overrides)
+            return base
         except (OSError, json.JSONDecodeError, ValueError) as exc:
-            raise RouterError(f"Cannot read quota configuration {self.config_path}: {exc}") from exc
+            raise RouterError(f"Cannot read quota configuration or built-in defaults: {exc}") from exc
 
     def _zone(self) -> ZoneInfo:
         try:
@@ -62,13 +74,18 @@ class LimitManager:
         except OSError as exc:
             raise RouterError(f"Cannot write local quota state {self.state_path}: {exc}") from exc
 
-    def _limits_for(self, model: str, config: dict[str, Any] | None = None) -> dict[str, int | None]:
+    def _limits_for(self, model: str, config: dict[str, Any] | None = None, display_name: str | None = None) -> dict[str, int | None]:
         config = config or self._config()
         defaults = config.get("defaults") or {}
         models = config.get("models") or {}
         if not isinstance(defaults, dict) or not isinstance(models, dict):
             raise RouterError("Quota config 'defaults' and 'models' values must be JSON objects")
-        per_model = models.get(model, {}) or {}
+        per_model = models.get(model)
+        if per_model is None and display_name:
+            normalize = lambda text: re.sub(r"[^a-z0-9]", "", text.lower())
+            display_key = normalize(display_name)
+            per_model = next((value for key, value in models.items() if normalize(key) == display_key), None)
+        per_model = per_model or {}
         if not isinstance(per_model, dict):
             raise RouterError(f"Quota settings for {model} must be a JSON object")
         names = ("requests_per_minute", "input_tokens_per_minute", "requests_per_day")
@@ -77,10 +94,10 @@ class LimitManager:
             raw = per_model.get(name, defaults.get(name))
             if raw is None:
                 limits[name] = None
-            elif isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+            elif isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
                 limits[name] = raw
             else:
-                raise RouterError(f"Quota '{name}' for {model} must be a positive integer or null")
+                raise RouterError(f"Quota '{name}' for {model} must be a non-negative integer or null")
         return limits
 
     def configured_limits(self, model: str) -> dict[str, int | None]:
@@ -114,12 +131,26 @@ class LimitManager:
             local_day = now.astimezone(zone).date()
             records = []
             ids = [m["id"] for m in models or []]
-            ids.extend(m for m in config.get("models", {}) if m not in ids)
+            model_names = {m["id"]: m.get("display_name", m["id"]) for m in models or []}
+            observed_ids = {str(event.get("model")) for event in state.get("events", []) if event.get("model")}
+            local_ids = list(config.get("models", {})) + [settings.default_model] + sorted(observed_ids)
+            ids.extend(m for m in local_ids if m not in ids)
             for model in ids:
-                limits = self._limits_for(model, config)
+                limits = self._limits_for(model, config, model_names.get(model))
                 events = self._active_events(state, model)
                 minute_events = [e for e in events if datetime.fromisoformat(e["at"]).astimezone(timezone.utc) >= now - timedelta(minutes=1)]
                 day_events = [e for e in events if datetime.fromisoformat(e["at"]).astimezone(zone).date() == local_day]
+                minute_events.sort(key=lambda e: datetime.fromisoformat(e["at"]).astimezone(timezone.utc))
+                minute_reset = (datetime.fromisoformat(minute_events[0]["at"]).astimezone(timezone.utc) + timedelta(minutes=1)) if minute_events else None
+                remaining_tokens = sum(int(e.get("input_tokens", 0)) for e in minute_events)
+                tpm_reset = None
+                token_cap = limits["input_tokens_per_minute"]
+                for event in minute_events:
+                    remaining_tokens -= int(event.get("input_tokens", 0))
+                    if token_cap is None or remaining_tokens < token_cap:
+                        tpm_reset = datetime.fromisoformat(event["at"]).astimezone(timezone.utc) + timedelta(minutes=1)
+                        break
+                daily_reset = self.next_daily_reset()
                 blocked = state.get("blocked_until", {}).get(model)
                 blocked_active = False
                 if blocked:
@@ -127,8 +158,16 @@ class LimitManager:
                         blocked_active = datetime.fromisoformat(blocked) > now
                     except ValueError:
                         pass
-                records.append({"model": model, "limits": limits, "used_last_minute": {"requests": len(minute_events), "input_tokens": sum(int(e.get("input_tokens", 0)) for e in minute_events)}, "used_today": {"requests": len(day_events), "input_tokens": sum(int(e.get("input_tokens", 0)) for e in day_events), "output_tokens": sum(int(e.get("output_tokens", 0)) for e in day_events)}, "blocked_until": blocked if blocked_active else None})
-            return {"timezone": str(zone), "daily_reset": "midnight local time in configured timezone (default America/Los_Angeles)", "limits_source": str(self.config_path), "state_file": str(self.state_path), "provider_limits_note": "Per-project Gemini RPM/TPM/RPD limits are not exposed by model discovery. Configure them from Google AI Studio; only model input/output token ceilings are automatic.", "models": records}
+                used_rpm = len(minute_events)
+                used_tpm = sum(int(e.get("input_tokens", 0)) for e in minute_events)
+                used_rpd = len(day_events)
+                records.append({"model": model, "display_name": model_names.get(model, model.replace("-", " ").title()), "limits": limits,
+                    "used_last_minute": {"requests": used_rpm, "input_tokens": used_tpm},
+                    "used_today": {"requests": used_rpd, "input_tokens": sum(int(e.get("input_tokens", 0)) for e in day_events), "output_tokens": sum(int(e.get("output_tokens", 0)) for e in day_events)},
+                    "current": {"rpm": used_rpm, "tpm": used_tpm, "rpd": used_rpd},
+                    "reset_at": {"rpm": minute_reset.isoformat() if minute_reset else None, "tpm": tpm_reset.isoformat() if tpm_reset else None, "rpd": daily_reset.isoformat()},
+                    "blocked_until": blocked if blocked_active else None})
+            return {"timezone": str(zone), "daily_reset": "midnight local time in configured timezone (default America/Los_Angeles)", "limits_source": str(self.config_path), "state_file": str(self.state_path), "accounting": "local_estimates; no Gemini countTokens call is made; provider usage is reconciled from ordinary Gemini responses when returned", "provider_limits_note": "RPM/TPM/RPD caps come from local quota configuration; usage is counted only for requests made through this smart_AI installation.", "models": records}
 
     def available_models(self, models: list[dict[str, Any]]) -> list[dict[str, Any]]:
         now = datetime.now(timezone.utc)
@@ -137,7 +176,7 @@ class LimitManager:
         candidates = []
         for model in models:
             model_id = model["id"]
-            limits = self._limits_for(model_id, config)
+            limits = self._limits_for(model_id, config, model.get("display_name"))
             events = self._active_events(state, model_id)
             minute_events = [e for e in events if datetime.fromisoformat(e["at"]).astimezone(timezone.utc) >= now - timedelta(minutes=1)]
             day_events = [e for e in events if datetime.fromisoformat(e["at"]).astimezone(self._zone()).date() == now.astimezone(self._zone()).date()]
@@ -145,18 +184,20 @@ class LimitManager:
             blocked_active = bool(blocked and datetime.fromisoformat(blocked) > now)
             if blocked_active:
                 continue
-            if limits["requests_per_minute"] is not None and len(minute_events) >= limits["requests_per_minute"]:
+            if limits["requests_per_minute"] == 0 or (limits["requests_per_minute"] is not None and len(minute_events) >= limits["requests_per_minute"]):
                 continue
-            if limits["requests_per_day"] is not None and len(day_events) >= limits["requests_per_day"]:
+            if limits["requests_per_day"] == 0 or (limits["requests_per_day"] is not None and len(day_events) >= limits["requests_per_day"]):
+                continue
+            if limits["input_tokens_per_minute"] == 0:
                 continue
             candidates.append(model)
         return candidates
 
-    def reserve(self, model: str, input_tokens: int, exact: bool = False) -> str:
+    def reserve(self, model: str, input_tokens: int, exact: bool = False, display_name: str | None = None) -> str:
         with self._lock:
             config = self._config()
             state = self._read_state()
-            limits = self._limits_for(model, config)
+            limits = self._limits_for(model, config, display_name)
             events = self._active_events(state, model)
             now = datetime.now(timezone.utc)
             minute_events = [e for e in events if datetime.fromisoformat(e["at"]).astimezone(timezone.utc) >= now - timedelta(minutes=1)]
@@ -167,11 +208,11 @@ class LimitManager:
             rpd = limits["requests_per_day"]
             rpm = limits["requests_per_minute"]
             tpm = limits["input_tokens_per_minute"]
-            if rpd is not None and len(day_events) >= rpd:
+            if rpd == 0 or (rpd is not None and len(day_events) >= rpd):
                 raise RouterError(f"Model {model} reached its configured requests_per_day quota; local daily counters reset at midnight {self._zone()}")
-            if rpm is not None and len(minute_events) >= rpm:
+            if rpm == 0 or (rpm is not None and len(minute_events) >= rpm):
                 raise RouterError(f"Model {model} reached its configured requests_per_minute quota; retry after the rolling 60-second window")
-            if tpm is not None and sum(int(e.get("input_tokens", 0)) for e in minute_events) + input_tokens > tpm:
+            if tpm == 0 or (tpm is not None and sum(int(e.get("input_tokens", 0)) for e in minute_events) + input_tokens > tpm):
                 raise RouterError(f"Model {model} would exceed its configured input_tokens_per_minute quota")
             event_id = uuid.uuid4().hex
             state.setdefault("events", []).append({"id": event_id, "model": model, "at": now.isoformat(), "input_tokens": max(0, input_tokens), "output_tokens": 0, "input_tokens_exact": exact})

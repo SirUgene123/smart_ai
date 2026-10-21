@@ -23,6 +23,7 @@ Copy-Item .env.example .env
 smart-ai ask "Explain how a hash table works"
 smart-ai ask "Describe this picture" --file .\picture.jpg
 smart-ai ask "Solve this carefully" --thinking-summaries --json
+smart-ai-gui
 smart-ai models
 smart-ai limits
 smart-ai serve
@@ -54,9 +55,15 @@ Multimodal input can use Gemini Interactions API input blocks. A message with me
 
 Use `system_instruction`, `previous_interaction_id`, `tools` for caller-defined function declarations, and a restricted `generation_config` override for supported output settings. `GET /v1/models` lists Gemini models visible to the configured key. `GET /v1/limits` returns local quota status; `POST /v1/limits/reset` clears local counters (optionally pass `{"model":"gemini-model-id"}`). `GET /health` is a liveness check. Interactive API docs are at `/docs`.
 
+## Excel prompt runner GUI
+
+Run `smart-ai-gui` (or `python -m smart_ai.gui`) to open the desktop prompt runner. Choose an `.xlsx`, `.xlsm`, or `.csv` file, enter a prompt containing a placeholder such as `##`, and select the delay between requests. The app reads non-empty cells in worksheet order, then row and column order (or CSV row and column order), replaces every placeholder occurrence with that cell's value, and sends one request at a time through the normal smart_AI router. Results can be saved as separate numbered `.txt` files. The Stop button finishes the in-flight request and then stops the queue. Keep the `.env` credentials configured as described above.
+
+If Gemini reports temporary model unavailability or rate limiting (HTTP 429/503), the CLI and GUI ask before switching. Timeouts, transient Gemini server errors, local per-model quota or input-limit errors, and Cloudflare planner network failures trigger automatic fallback. The app tries at most three other models that pass the configured local limits, preferring newer text-capable Flash Lite and Flash models, and skips Cloudflare planning for each attempt. TTS, live, embedding, and image-generation models are excluded from text fallbacks, and a model-specific 404/410 is skipped for the rest of the process. In the GUI, a successful fallback is reused for the remaining rows in that run; if it stops working, the app tries other eligible models again. Default request timeouts are 30 seconds for Gemini, 8 seconds for Gemini model discovery, and 15 seconds for Cloudflare planning. Configure them with `GEMINI_REQUEST_TIMEOUT_SECONDS`, `GEMINI_DISCOVERY_TIMEOUT_SECONDS`, and `CLOUDFLARE_TIMEOUT_SECONDS` respectively; `HTTP_TIMEOUT_SECONDS` can lower these values.
+
 ## Model limits and quota tracking
 
-`smart-ai models` fetches models visible to the Gemini key and shows each model's input/output token ceilings, supported generation methods, thinking support, and generation parameter metadata. Before each request, smart_AI calls Gemini's `countTokens` endpoint for the selected model and supported input types, including inline media. It rejects counted inputs over that model's input ceiling and caps `max_output_tokens` at its published output ceiling.
+`smart-ai models` fetches models visible to the Gemini key and shows each model's input/output token ceilings, supported generation methods, thinking support, and generation parameter metadata. Request quota checks do not call Gemini's `countTokens` endpoint: smart_AI estimates text and media token use locally, checks the configured rolling RPM/TPM/RPD windows, and labels the estimate as inexact. This trades exact preflight tokenization for offline quota accounting; media estimates are especially approximate. After the normal Gemini generation request, returned usage metadata replaces the estimate in local history when available. The router also uses its discovered model metadata to cap `max_output_tokens` at the model's output ceiling.
 
 If Gemini rejects a model-specific thinking level or another optional setting, smart_AI retries only when the 400 error explicitly identifies an unsupported option. For thinking-level errors it tries another level, then omits the setting if needed, and remembers rejected levels per model in local state. The response includes `effective_request_options` so callers can see the settings and tools that Gemini accepted.
 
@@ -69,7 +76,9 @@ Copy-Item .\quota_limits.example.json "$HOME\.smart_ai\quotas.json"
 
 Use exact model IDs from `smart-ai models`. Set `timezone` to `America/Los_Angeles` for Gemini's documented daily quota reset at midnight Pacific. Configured requests-per-minute and input-tokens-per-minute limits use a rolling 60-second window. Daily counters roll over automatically at midnight in the configured timezone. Usage state stores model IDs, timestamps, and token/request counts in `~/.smart_ai/limit_state.json`.
 
-`smart-ai limits` or `GET /v1/limits` shows the configured quotas and local usage. `smart-ai reset-limits` (or `POST /v1/limits/reset`) clears only smart_AI's local counters and cooldowns; it cannot reset a quota enforced by Google. Gemini 429 responses temporarily pause the affected model locally, until its retry time or the next daily reset for daily-quota errors. Gemini quotas apply across the whole project, so requests made by other apps are not visible to this local tracker; Google AI Studio remains the source of truth.
+`smart-ai limits` displays a per-model RPM/TPM/RPD table with locally tracked current counts and estimated rolling-window/daily reset times. The command and `GET /v1/limits` read local files only and make no provider requests; the API provides the same data as JSON (`current`, `limits`, `reset_at`). The attached quota snapshot is bundled as the app's starting configuration; create `~/.smart_ai/quotas.json` to override it for your project. Overrides are merged with bundled values, and `0` means that quota is unavailable for the model. The daily reset timezone defaults to `America/Los_Angeles`.
+
+Local current counts include only requests routed through this smart_AI installation. They cannot import the live current usage shown in Google AI Studio or count activity from other apps, so reset times are estimates based on this installation's request timestamps. TPM reset indicates when the rolling input-token window next frees capacity; RPM reset is when the oldest request expires. `smart-ai reset-limits` (or `POST /v1/limits/reset`) clears only smart_AI's local counters and cooldowns; it cannot reset Google's quota. Gemini 429 responses temporarily pause the affected model locally, until its retry time or the next daily reset for daily-quota errors. Google AI Studio remains the source of truth for project-wide usage.
 
 The Cloudflare decision prompt is in `smart_ai/prompts/router.md`. Edit that file to tune routing policy. The planner's model is configurable via `CLOUDFLARE_PLANNER_MODEL`.
 

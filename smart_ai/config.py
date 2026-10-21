@@ -25,6 +25,9 @@ class Settings:
     default_max_output_tokens = int(env("GEMINI_MAX_OUTPUT_TOKENS", "4096"))
     default_store = env("GEMINI_STORE", "false").lower() == "true"
     timeout_seconds = float(env("HTTP_TIMEOUT_SECONDS", "90"))
+    gemini_request_timeout_seconds = min(timeout_seconds, float(env("GEMINI_REQUEST_TIMEOUT_SECONDS", "30")))
+    gemini_discovery_timeout_seconds = min(timeout_seconds, float(env("GEMINI_DISCOVERY_TIMEOUT_SECONDS", "8")))
+    planner_timeout_seconds = min(timeout_seconds, float(env("CLOUDFLARE_TIMEOUT_SECONDS", "15")))
     usage_file = Path(env("SMART_AI_USAGE_FILE", str(Path.home() / ".smart_ai" / "usage.json"))).expanduser()
     quota_file = Path(env("SMART_AI_QUOTAS_FILE", str(Path.home() / ".smart_ai" / "quotas.json"))).expanduser()
     limit_state_file = Path(env("SMART_AI_LIMIT_STATE_FILE", str(Path.home() / ".smart_ai" / "limit_state.json"))).expanduser()

@@ -3,13 +3,17 @@ from __future__ import annotations
 import json
 import math
 import re
+import asyncio
+import copy
+import time
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 
 from .config import settings
-from .errors import RouterError
+from .errors import ModelUnavailableError, RouterError
 from .limits import LimitManager
 
 
@@ -44,6 +48,10 @@ def _json_object(value: Any) -> dict[str, Any]:
 
 
 class Providers:
+    _models_cache: list[dict[str, Any]] | None = None
+    _models_cache_time = 0.0
+    _unavailable_models: set[str] = set()
+
     def __init__(self) -> None:
         self.http = httpx.AsyncClient(timeout=settings.timeout_seconds)
         self.limits = LimitManager()
@@ -63,13 +71,27 @@ class Providers:
 
     async def models(self) -> list[dict[str, Any]]:
         self.require_gemini_config()
+        cache_owner = type(self)
+        if cache_owner._models_cache is not None and time.monotonic() - cache_owner._models_cache_time < 300:
+            return copy.deepcopy(cache_owner._models_cache)
         url = f"{settings.gemini_api_base}/models"
-        try:
-            response = await self.http.get(url, headers={"x-goog-api-key": settings.gemini_api_key}, params={"pageSize": 1000})
-        except httpx.HTTPError as exc:
-            raise RouterError(f"Gemini model discovery network error: {exc}") from exc
+        response = None
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                response = await self.http.get(url, headers={"x-goog-api-key": settings.gemini_api_key}, params={"pageSize": 1000}, timeout=settings.gemini_discovery_timeout_seconds)
+                if response.status_code not in {429, 500, 502, 503, 504} or attempt == 1:
+                    break
+                last_error = RouterError(f"HTTP {response.status_code}: {response.text[:300]}")
+            except httpx.HTTPError as exc:
+                last_error = exc
+                if attempt == 1:
+                    raise RouterError(f"Gemini model discovery network error after 2 attempts: {exc}") from exc
+            await asyncio.sleep(0.25)
+        if response is None:
+            raise RouterError(f"Gemini model discovery network error: {last_error}")
         if response.is_error:
-            raise RouterError(f"Gemini model discovery failed ({response.status_code}): {response.text[:500]}")
+            raise RouterError(f"Gemini model discovery failed ({response.status_code}) after retries: {response.text[:500]}")
         try:
             data = response.json()
         except ValueError as exc:
@@ -94,6 +116,8 @@ class Providers:
             })
         if not found:
             found = [{"id": settings.default_model, "display_name": settings.default_model, "input_token_limit": None, "output_token_limit": None, "supported_generation_methods": [], "supports_thinking": None}]
+        cache_owner._models_cache = copy.deepcopy(found)
+        cache_owner._models_cache_time = time.monotonic()
         return found
 
     async def plan(self, request: dict[str, Any], models: list[dict[str, Any]], hints: dict[str, Any]) -> dict[str, Any]:
@@ -105,9 +129,9 @@ class Providers:
         prompt = prompt_template.replace("{{ROUTING_CONTEXT}}", json.dumps(context, ensure_ascii=False)).replace("{{USER_REQUEST}}", json.dumps(safe_request, ensure_ascii=False))
         url = f"{settings.cloudflare_api_base}/accounts/{settings.cloudflare_account_id}/ai/run/{settings.planner_model}"
         try:
-            response = await self.http.post(url, headers={"Authorization": f"Bearer {settings.cloudflare_api_token}"}, json={"messages": [{"role": "system", "content": "Return only the JSON object required by the supplied routing prompt."}, {"role": "user", "content": prompt}], "max_tokens": 700, "temperature": 0.1})
+            response = await self.http.post(url, headers={"Authorization": f"Bearer {settings.cloudflare_api_token}"}, json={"messages": [{"role": "system", "content": "Return only the JSON object required by the supplied routing prompt."}, {"role": "user", "content": prompt}], "max_tokens": 700, "temperature": 0.1}, timeout=settings.planner_timeout_seconds)
         except httpx.HTTPError as exc:
-            raise RouterError(f"Cloudflare planner network error: {exc}") from exc
+            raise ModelUnavailableError("unknown", f"Cloudflare planner timed out or lost its connection: {exc}") from exc
         if response.is_error:
             raise RouterError(f"Cloudflare planner failed ({response.status_code}): {response.text[:500]}")
         try:
@@ -126,7 +150,9 @@ class Providers:
         self.require_gemini_config()
         for _ in range(9):
             try:
-                response = await self.http.post(f"{settings.gemini_api_base}/interactions", headers={"x-goog-api-key": settings.gemini_api_key}, json=body)
+                response = await self.http.post(f"{settings.gemini_api_base}/interactions", headers={"x-goog-api-key": settings.gemini_api_key}, json=body, timeout=settings.gemini_request_timeout_seconds)
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+                raise ModelUnavailableError(body.get("model", "unknown"), f"Gemini request timed out or lost its connection: {exc}") from exc
             except httpx.HTTPError as exc:
                 raise RouterError(f"Gemini request network error: {exc}") from exc
             if not response.is_error:
@@ -147,7 +173,13 @@ class Providers:
                         delay = 60
                     retry_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
                 self.limits.pause(body.get("model", "unknown"), retry_at)
-            raise RouterError(f"Gemini request failed ({response.status_code}): {detail}")
+            message = f"Gemini request failed ({response.status_code}): {detail}"
+            if response.status_code in {404, 410}:
+                self._unavailable_models.add(body.get("model", "unknown"))
+                raise ModelUnavailableError(body.get("model", "unknown"), message)
+            if response.status_code in {429, 500, 502, 503, 504}:
+                raise ModelUnavailableError(body.get("model", "unknown"), message, requires_confirmation=response.status_code in {429, 503})
+            raise RouterError(message)
         raise RouterError("Gemini rejected every supported thinking-level fallback for this model")
 
     def _adjust_unsupported_config(self, body: dict[str, Any], detail: str) -> bool:
@@ -211,79 +243,53 @@ class Providers:
             return [cls._planner_safe_value(item) for item in value]
         return value
 
-    @staticmethod
-    def _contents_for_count(input_value: Any) -> list[dict[str, Any]]:
-        blocks = input_value if isinstance(input_value, list) else [{"type": "text", "text": str(input_value)}]
-        parts: list[dict[str, Any]] = []
+    @classmethod
+    def _estimate_input_tokens(cls, value: Any) -> int:
+        """Estimate input locally; media estimates are intentionally conservative heuristics."""
+        text_parts: list[str] = []
+        media_tokens = 0
 
-        def add(block: Any) -> None:
-            if not isinstance(block, dict):
+        def visit(item: Any) -> None:
+            nonlocal media_tokens
+            if isinstance(item, str):
+                text_parts.append(item)
                 return
-            kind = block.get("type")
-            if kind == "user_input":
-                for child in block.get("content", []):
-                    add(child)
-            elif kind == "text" and isinstance(block.get("text"), str):
-                parts.append({"text": block["text"]})
-            elif kind in {"image", "audio", "document", "video"}:
-                mime = block.get("mime_type") or block.get("mimeType")
-                if block.get("data") and mime:
-                    parts.append({"inlineData": {"mimeType": mime, "data": block["data"]}})
-                elif block.get("uri") and mime:
-                    parts.append({"fileData": {"mimeType": mime, "fileUri": block["uri"]}})
-            elif "parts" in block:
-                for part in block.get("parts", []):
-                    add(part)
+            if isinstance(item, list):
+                for child in item:
+                    visit(child)
+                return
+            if not isinstance(item, dict):
+                return
+            kind = str(item.get("type", "")).lower()
+            if kind == "text" and isinstance(item.get("text"), str):
+                text_parts.append(item["text"])
+            elif kind in {"image", "audio", "document", "video", "media"}:
+                data = item.get("data")
+                raw_bytes = (len(data) * 3) // 4 if isinstance(data, str) else 0
+                if kind == "image":
+                    media_tokens += max(1024, math.ceil(raw_bytes / 8192)) if raw_bytes else 1024
+                elif kind in {"audio", "video"}:
+                    media_tokens += max(1024, math.ceil(raw_bytes / 512)) if raw_bytes else 4096
+                else:  # PDFs/documents: approximate one token per two bytes.
+                    media_tokens += max(1024, math.ceil(raw_bytes / 2)) if raw_bytes else 4096
+            for key, child in item.items():
+                if key in {"text", "data", "uri", "mime_type", "mimeType", "type"}:
+                    continue
+                visit(child)
 
-        for block in blocks:
-            add(block)
-        if not parts:
-            return []
-        return [{"role": "user", "parts": parts}]
+        visit(value)
+        text_bytes = sum(len(part.encode("utf-8")) for part in text_parts)
+        return max(1, math.ceil(text_bytes / 2) + media_tokens)
 
-    @classmethod
-    def _text_for_estimate(cls, value: Any) -> str:
-        if isinstance(value, str):
-            return value
-        if isinstance(value, list):
-            return " ".join(cls._text_for_estimate(item) for item in value)
-        if isinstance(value, dict):
-            if value.get("type") == "text" and isinstance(value.get("text"), str):
-                return value["text"]
-            return " ".join(cls._text_for_estimate(item) for key, item in value.items() if key not in {"data", "uri"})
-        return ""
-
-    @classmethod
-    def _contains_media(cls, value: Any) -> bool:
-        if isinstance(value, list):
-            return any(cls._contains_media(item) for item in value)
-        if isinstance(value, dict):
-            return value.get("type") in {"image", "audio", "document", "video", "media"} or any(cls._contains_media(item) for item in value.values())
-        return False
-
-    async def count_input_tokens(self, model: str, request: dict[str, Any]) -> tuple[int, bool]:
-        contents = self._contents_for_count(request.get("input"))
-        if contents:
-            try:
-                count_response = await self.http.post(
-                    f"{settings.gemini_api_base}/models/{model}:countTokens",
-                    headers={"x-goog-api-key": settings.gemini_api_key},
-                    json={"generateContentRequest": {
-                        "contents": contents,
-                        **({"systemInstruction": {"parts": [{"text": request["system_instruction"]}]}} if isinstance(request.get("system_instruction"), str) else {}),
-                    }},
-                )
-                if not count_response.is_error:
-                    count = count_response.json().get("totalTokens")
-                    if isinstance(count, int) and count >= 0:
-                        return count, True
-            except (httpx.HTTPError, ValueError):
-                pass
-        # Fallback is deliberately labeled as an estimate; media tokenization is model-specific.
-        text = self._text_for_estimate(request.get("input", ""))
-        if isinstance(request.get("system_instruction"), str):
-            text += request["system_instruction"]
-        return max(1, math.ceil(len(text) / 3)), False
+    def count_input_tokens(self, model: str, request: dict[str, Any]) -> tuple[int, bool]:
+        # Quota accounting must remain offline. Gemini usage from the normal
+        # generation response replaces this estimate when the provider returns it.
+        value = request.get("input", "")
+        tokens = self._estimate_input_tokens(value)
+        instruction = request.get("system_instruction")
+        if instruction is not None:
+            tokens += self._estimate_input_tokens(instruction)
+        return tokens, False
 
     @staticmethod
     def _token_usage(result: dict[str, Any], fallback_input: int) -> tuple[int, int]:
@@ -292,7 +298,40 @@ class Providers:
         output_tokens = usage.get("total_output_tokens", usage.get("output_tokens", usage.get("candidates_token_count", usage.get("candidatesTokenCount", 0))))
         return int(input_tokens or fallback_input), int(output_tokens or 0)
 
-    async def run(self, request: dict[str, Any], hints: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def fallback_models(self, failed_model: str) -> list[str]:
+        """List locally eligible alternatives, preferring Flash Lite and Flash models."""
+        models = await self.models()
+        candidates = self.limits.available_models(models)
+        choices = [item for item in candidates if item["id"] != failed_model and item["id"] not in self._unavailable_models]
+        def rank(item: dict[str, Any]) -> tuple[int, int, int, str]:
+            name = (item["id"] + " " + item.get("display_name", "")).lower()
+            model_id = item["id"].lower()
+            if any(tag in model_id for tag in ("-tts", "-live", "-image", "embedding", "imagen")):
+                return (3, 0, 0, item["id"])
+            if "flash-lite" in name or "flash_lite" in name:
+                tier = 0
+            elif "flash" in name:
+                tier = 1
+            else:
+                tier = 2
+            version = re.search(r"gemini-(\d+)\.(\d+)", model_id)
+            major, minor = (int(version.group(1)), int(version.group(2))) if version else (0, 0)
+            return (tier, -major, -minor, item["id"])
+        return [item["id"] for item in sorted(choices, key=rank) if rank(item)[0] < 3]
+
+    async def run_fallbacks(self, request: dict[str, Any], hints: dict[str, Any] | None, failed_model: str) -> dict[str, Any]:
+        """Retry on other locally eligible models without invoking Cloudflare planning."""
+        failures: list[str] = []
+        for model in (await self.fallback_models(failed_model))[:3]:
+            try:
+                return await self.run(request, hints, model_override=model)
+            except RouterError as exc:
+                failures.append(f"{model}: {exc}")
+        if failures:
+            raise RouterError("No eligible fallback model completed the request. " + " | ".join(failures))
+        raise RouterError("No other model is available under the configured local limits or cooldowns.")
+
+    async def run(self, request: dict[str, Any], hints: dict[str, Any] | None = None, model_override: str | None = None) -> dict[str, Any]:
         models = await self.models()
         hints = hints or {}
         candidates = self.limits.available_models(models)
@@ -301,22 +340,23 @@ class Providers:
         for candidate in candidates:
             candidate["known_unsupported_thinking_levels"] = sorted(self.limits.unsupported_thinking_levels(candidate["id"]))
             candidate["thinking_level_parameter_supported"] = not self.limits.thinking_level_parameter_unsupported(candidate["id"])
-        plan = await self.plan(request, candidates, hints)
+        if model_override:
+            plan = {"model": model_override, "max_output_tokens": settings.default_max_output_tokens, "temperature": 0.3, "thinking_level": "low", "thinking_summaries": "none", "tools": [], "store": settings.default_store}
+        else:
+            plan = await self.plan(request, candidates, hints)
         model_ids = {m["id"] for m in candidates}
         model = plan.get("model")
         if not isinstance(model, str) or model not in model_ids:
+            if model_override:
+                raise ModelUnavailableError(model_override, f"Fallback model {model_override} is unavailable under the configured local limits or cooldowns.")
             raise RouterError("Planner selected a model that is unavailable or excluded by the configured local quotas")
         model_info = next(m for m in candidates if m["id"] == model)
-        input_tokens, exact_token_count = await self.count_input_tokens(model, request)
-        if self.limits.configured_limits(model)["input_tokens_per_minute"] is not None and not exact_token_count:
-            raise RouterError("Could not count this request's tokens exactly, so the configured input_tokens_per_minute quota cannot be enforced safely")
+        input_tokens, exact_token_count = self.count_input_tokens(model, request)
         input_limit = model_info.get("input_token_limit")
         output_limit = model_info.get("output_token_limit")
-        if input_limit and not exact_token_count and self._contains_media(request.get("input")):
-            raise RouterError("Gemini could not count this media input exactly, so smart_AI cannot safely verify the selected model's input token limit")
         if input_limit and input_tokens > int(input_limit):
             precision = "counted" if exact_token_count else "estimated"
-            raise RouterError(f"Input is {input_tokens} {precision} tokens, above {model}'s input limit of {input_limit}")
+            raise ModelUnavailableError(model, f"Input is {input_tokens} {precision} tokens, above {model}'s input limit of {input_limit}")
         try:
             raw_max_tokens = plan.get("max_output_tokens", settings.default_max_output_tokens)
             raw_temperature = plan.get("temperature", 0.3)
@@ -380,7 +420,10 @@ class Providers:
             if not isinstance(overrides, dict) or set(overrides) - {"temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty", "seed", "stop_sequences", "response_mime_type", "response_schema"}:
                 raise RouterError("Unsupported generation_config override")
             body["generation_config"].update(overrides)
-        reservation = self.limits.reserve(model, input_tokens, exact_token_count)
+        try:
+            reservation = self.limits.reserve(model, input_tokens, exact_token_count, model_info.get("display_name"))
+        except RouterError as exc:
+            raise ModelUnavailableError(model, str(exc)) from exc
         result = await self.run_gemini(body)
         actual_input, actual_output = self._token_usage(result, input_tokens)
         self.limits.finish(reservation, actual_input, actual_output)
